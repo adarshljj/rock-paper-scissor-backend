@@ -19,6 +19,7 @@ export type GameChangeReason =
   | "move"
   | "player_name"
   | "presence"
+  | "player_removed"
   | "deleted";
 
 type GameChangeListener = (gameId: string, reason: GameChangeReason) => void;
@@ -257,6 +258,34 @@ export class GameService {
     game.playerStatus[playerId] = "offline";
     game.lastActivityAt = new Date();
     this.notify(gameId, "presence");
+  }
+
+  removePlayerForInactivity(gameId: string, playerId: PlayerId): void {
+    const game = this.getGame(gameId);
+    if (!game) return;
+
+    if (game.type === "pvc") {
+      if (playerId !== game.player1Id) return;
+      this.deleteGame(gameId);
+      return;
+    }
+
+    // If the host times out, close room entirely. If the joiner times out, free slot.
+    if (playerId === game.player1Id) {
+      this.deleteGame(gameId);
+      return;
+    }
+    if (game.player2Id !== null && playerId === game.player2Id) {
+      game.playerStatus[playerId] = "offline";
+      delete game.playerStatus[playerId];
+      game.player2Id = null;
+      game.player2Name = null;
+      game.status = "waiting";
+      game.rounds = [];
+      this.pendingMoves.delete(gameId);
+      game.lastActivityAt = new Date();
+      this.notify(gameId, "player_removed");
+    }
   }
 
   startGame(gameId: string): void {

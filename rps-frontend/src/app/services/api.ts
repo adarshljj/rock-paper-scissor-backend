@@ -292,29 +292,6 @@ export async function joinRoom(
   return { playerId: data.playerId, game: data.game };
 }
 
-export async function submitChoice(
-  roomId: string,
-  playerId: string,
-  choice: Choice
-): Promise<SerializedGame> {
-  if (!choice) {
-    throw new Error("Invalid choice");
-  }
-  const res = await fetch(
-    apiUrl(`/api/games/${encodeURIComponent(roomId)}/play`),
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ playerId, move: choice }),
-    }
-  );
-  if (!res.ok) {
-    throw new Error(await readError(res));
-  }
-  await res.json();
-  return fetchGame(roomId);
-}
-
 export async function startNewGame(roomId: string): Promise<SerializedGame> {
   const res = await fetch(
     apiUrl(`/api/games/${encodeURIComponent(roomId)}/reset`),
@@ -358,15 +335,30 @@ type WsMessage =
       round?: unknown;
     };
 
+type ClientWsMessage =
+  | { type: "ping" }
+  | { type: "move"; move: NonNullable<Choice> };
+
+export interface RoomSocketConnection {
+  sendMove: (choice: Choice) => void;
+  close: () => void;
+}
+
 export function subscribeToRoom(
   roomId: string,
   playerId: string,
   onGame: (game: SerializedGame) => void
-): () => void {
+): RoomSocketConnection {
   const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
   const ws = new WebSocket(
     `${protocol}//${window.location.host}/api/games/${encodeURIComponent(roomId)}/ws?playerId=${encodeURIComponent(playerId)}`
   );
+  const heartbeatTimer = window.setInterval(() => {
+    if (ws.readyState === WebSocket.OPEN) {
+      const ping: ClientWsMessage = { type: "ping" };
+      ws.send(JSON.stringify(ping));
+    }
+  }, 3000);
 
   ws.onmessage = (ev) => {
     try {
@@ -379,7 +371,19 @@ export function subscribeToRoom(
     }
   };
 
-  return () => {
+  const sendMove = (choice: Choice): void => {
+    if (!choice) {
+      throw new Error("Invalid choice");
+    }
+    if (ws.readyState !== WebSocket.OPEN) {
+      throw new Error("Realtime connection is not ready");
+    }
+    const msg: ClientWsMessage = { type: "move", move: choice };
+    ws.send(JSON.stringify(msg));
+  };
+
+  const close = (): void => {
+    window.clearInterval(heartbeatTimer);
     ws.onmessage = null;
     ws.onerror = null;
     ws.onopen = null;
@@ -391,4 +395,6 @@ export function subscribeToRoom(
       ws.close(1000, "client closed");
     }
   };
+
+  return { sendMove, close };
 }

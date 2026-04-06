@@ -1,4 +1,5 @@
 import type { CompletedMatch, Game, RoundResult } from "./game.js";
+import type { Move } from "./game.js";
 
 export type SerializedCompletedMatch = Omit<CompletedMatch, "finishedAt"> & {
   finishedAt: string;
@@ -25,4 +26,14 @@ export type ServerToClientMessage =
       gameId: string;
       round: RoundResult;
       game: SerializedGame;
+    };
+
+/** Client → server WebSocket messages. */
+export type ClientToServerMessage =
+  | {
+      type: "move";
+      move: Move;
+    }
+  | {
+      type: "ping";
     };

@@ -1,23 +1,35 @@
 import type { Server } from "node:http";
 import WebSocket, { WebSocketServer } from "ws";
 import type { GameChangeReason, GameService } from "./gameService.js";
-import type { PlayerId } from "../shared/types/game.js";
-import type { ServerToClientMessage } from "../shared/types/ws.js";
+import { MOVES, type PlayerId } from "../shared/types/game.js";
+import type { ClientToServerMessage, ServerToClientMessage } from "../shared/types/ws.js";
 import { serializeGame } from "../shared/utils/serializeGame.js";
 
 /**
  * Tracks WebSocket clients per game and broadcasts typed events when {@link GameService} changes.
  */
 export class GameRoomHub {
+  private static readonly HEARTBEAT_PING_MS = 3_000;
+  private static readonly HEARTBEAT_TIMEOUT_MS = 15_000;
   private readonly rooms = new Map<string, Set<WebSocket>>();
   /** Ref-count WebSocket connections per `gameId` + `playerId` so only the last close marks offline. */
   private readonly connectionCounts = new Map<string, Map<string, number>>();
+  /** Last heartbeat/message per connection for inactivity timeout. */
+  private readonly lastSeenBySocket = new Map<WebSocket, number>();
+  /** Track sockets to game/player for timeout handling. */
+  private readonly socketMeta = new Map<WebSocket, { gameId: string; playerId: PlayerId }>();
   private readonly lastRoundCount = new Map<string, number>();
+  private readonly heartbeatSweep: NodeJS.Timeout;
 
   constructor(private readonly gameService: GameService) {
     this.gameService.onGameChange((gameId, reason) => {
       this.broadcastGameChange(gameId, reason);
     });
+    this.heartbeatSweep = setInterval(
+      () => this.evictInactiveConnections(),
+      GameRoomHub.HEARTBEAT_PING_MS
+    );
+    this.heartbeatSweep.unref();
   }
 
   /** Attach upgrade handler to the HTTP server for `GET /api/games/:gameId/ws?playerId=`. */
@@ -99,6 +111,8 @@ export class GameRoomHub {
     }
     set.add(ws);
     this.incrementPresence(gameId, playerId);
+    this.lastSeenBySocket.set(ws, Date.now());
+    this.socketMeta.set(ws, { gameId, playerId });
 
     const game = this.gameService.getGame(gameId);
     if (game) {
@@ -109,6 +123,8 @@ export class GameRoomHub {
     const onLeave = (): void => {
       if (left) return;
       left = true;
+      this.lastSeenBySocket.delete(ws);
+      this.socketMeta.delete(ws);
       set!.delete(ws);
       if (set!.size === 0) {
         this.rooms.delete(gameId);
@@ -116,8 +132,54 @@ export class GameRoomHub {
       this.decrementPresence(gameId, playerId);
     };
 
+    ws.on("message", (raw) => this.onClientMessage(ws, raw));
     ws.on("close", onLeave);
     ws.on("error", onLeave);
+  }
+
+  private onClientMessage(ws: WebSocket, raw: WebSocket.RawData): void {
+    const meta = this.socketMeta.get(ws);
+    if (!meta) return;
+    this.lastSeenBySocket.set(ws, Date.now());
+
+    let message: ClientToServerMessage;
+    try {
+      message = JSON.parse(raw.toString()) as ClientToServerMessage;
+    } catch {
+      return;
+    }
+
+    if (message.type === "ping") {
+      return;
+    }
+
+    if (message.type === "move") {
+      if (!MOVES.includes(message.move)) {
+        return;
+      }
+      try {
+        this.gameService.move(meta.gameId, meta.playerId, message.move);
+      } catch {
+        // Invalid state/game/player; ignore malformed or stale client actions.
+      }
+    }
+  }
+
+  private evictInactiveConnections(): void {
+    const now = Date.now();
+    for (const [ws, lastSeen] of this.lastSeenBySocket) {
+      if (now - lastSeen <= GameRoomHub.HEARTBEAT_TIMEOUT_MS) continue;
+      const meta = this.socketMeta.get(ws);
+      if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
+        ws.close(4001, "heartbeat timeout");
+      }
+      if (!meta) continue;
+      const counts = this.connectionCounts.get(meta.gameId);
+      const activeConnections = counts?.get(meta.playerId) ?? 0;
+      if (activeConnections <= 1) {
+        this.gameService.removePlayerForInactivity(meta.gameId, meta.playerId);
+      }
+    }
   }
 
   private send(ws: WebSocket, msg: ServerToClientMessage): void {

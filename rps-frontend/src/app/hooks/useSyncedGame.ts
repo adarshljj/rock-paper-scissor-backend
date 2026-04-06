@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   createRoom,
   fetchGame,
@@ -7,12 +7,12 @@ import {
   STORAGE_PLAYER_ID,
   STORAGE_ROOM_ID,
   startNewGame as resetGameApi,
-  submitChoice as playMoveApi,
   subscribeToRoom,
   updateDisplayName as patchDisplayNameApi,
   type Choice,
   type GameMode,
   type GameState,
+  type RoomSocketConnection,
   type SerializedGame,
 } from "../services/api";
 
@@ -36,6 +36,7 @@ export function useSyncedGame(): UseSyncedGameResult {
   const [ready, setReady] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
+  const roomSocketRef = useRef<RoomSocketConnection | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -77,7 +78,14 @@ export function useSyncedGame(): UseSyncedGameResult {
     const id = game?.id;
     if (!id || !playerId) return;
 
-    return subscribeToRoom(id, playerId, setGame);
+    const socket = subscribeToRoom(id, playerId, setGame);
+    roomSocketRef.current = socket;
+    return () => {
+      socket.close();
+      if (roomSocketRef.current === socket) {
+        roomSocketRef.current = null;
+      }
+    };
   }, [game?.id, playerId]);
 
   const clearError = useCallback(() => setError(""), []);
@@ -114,13 +122,12 @@ export function useSyncedGame(): UseSyncedGameResult {
     async (choice: Choice) => {
       if (!game) return;
       try {
-        const next = await playMoveApi(game.id, playerId, choice);
-        setGame(next);
+        roomSocketRef.current?.sendMove(choice);
       } catch (e) {
         setError(e instanceof Error ? e.message : "Failed to submit choice");
       }
     },
-    [game, playerId]
+    [game]
   );
 
   const startNewGame = useCallback(async () => {
